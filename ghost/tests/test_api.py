@@ -28,8 +28,8 @@ class TestFrappeIdentityAPI(unittest.TestCase):
 		
 		# Verify return structure
 		self.assertIn("user", result)
-		self.assertIn("api_key", result)
-		self.assertIn("api_secret", result)
+		self.assertIn("access_token", result)
+		self.assertIn("refresh_token", result)
 		
 		email = result["user"]
 		self.assertTrue(email.startswith("ghost_"))
@@ -41,9 +41,6 @@ class TestFrappeIdentityAPI(unittest.TestCase):
 		# Verify Role
 		roles = [r.role for r in user.roles]
 		self.assertIn("Ghost", roles)
-		
-		# Verify API Key matches (hashed secret can't be verified easily, but key exists)
-		self.assertEqual(user.api_key, result["api_key"])
 		
 		print(f"\n[Success] Created Ghost User: {email}")
 
@@ -138,8 +135,12 @@ class TestFrappeIdentityAPI(unittest.TestCase):
 		# 4. Verify
 		self.assertFalse(frappe.db.exists("User", ghost_email), "Ghost email should be renamed")
 		self.assertTrue(frappe.db.exists("User", real_email), "Real email should exist")
+		self.assertEqual(result.get("conversion_mode"), "rename")
+		self.assertFalse(result.get("merged"))
+		self.assertTrue(result.get("access_token"))
 		
 		user = frappe.get_doc("User", real_email)
+		self.assertEqual(user.email, real_email)
 		self.assertEqual(user.first_name, "Real")
 		self.assertEqual(user.last_name, "Human")
 		
@@ -149,11 +150,12 @@ class TestFrappeIdentityAPI(unittest.TestCase):
 		
 		print(f"\n[Success] Converted {ghost_email} -> {real_email}")
 
-	def test_convert_merge_existing(self):
+	def test_convert_existing_user_manual_migration(self):
 		"""
-		Test merging a Ghost User into an EXISTING Real User.
+		Existing real user path should use app-level migration only.
 		"""
 		from ghost.api.ghost import create_ghost_session, convert_to_real_user
+		from ghost.ghost.doctype.otp.otp import generate as generate_otp
 
 		# 1. Create Ghost
 		ghost_data = create_ghost_session()
@@ -165,31 +167,36 @@ class TestFrappeIdentityAPI(unittest.TestCase):
 			u = frappe.new_doc("User")
 			u.email = real_email
 			u.first_name = "Existing"
+			u.last_name = "Durable"
 			u.save(ignore_permissions=True)
 		
-		# 3. Create a linked document to Ghost (e.g. ToDo) to verify ownership transfer
-		todo = frappe.get_doc({
-			"doctype": "ToDo",
-			"description": "Ghost Task"
-		}).insert(ignore_permissions=True)
-		# Force owner to be ghost (since we are running as Admin)
-		todo.owner = ghost_email
-		todo.db_update()
+		# 3. Create app-owned ghost-linked data (OTP.user)
+		otp_result = generate_otp(email="manual_migration_source@example.com", purpose="Login", user=ghost_email, send=False)
+		otp_name = otp_result.get("name")
+		self.assertTrue(otp_name)
+		self.assertEqual(frappe.db.get_value("OTP", otp_name, "user"), ghost_email)
 		
-		# 4. Convert (Merge)
-		result = convert_to_real_user(ghost_email, real_email)
+		# 4. Convert (manual migration path)
+		result = convert_to_real_user(ghost_email, real_email, first_name="ShouldNot", last_name="Override")
 		
 		# 5. Verify
-		self.assertTrue(result.get("merged"), "Should return merged=True")
-		self.assertFalse(frappe.db.exists("User", ghost_email), "Ghost user should be deleted")
+		self.assertFalse(result.get("merged"), "No framework merge should be reported")
+		self.assertEqual(result.get("conversion_mode"), "manual_migration")
+		self.assertTrue(frappe.db.exists("User", ghost_email), "Ghost user should be retained in disabled state")
 		self.assertTrue(frappe.db.exists("User", real_email), "Real user should remain")
+		self.assertTrue(result.get("access_token"))
 		
-		# Check ToDo ownership
-		todo.reload()
-		self.assertEqual(todo.owner, real_email, "ToDo owner should be updated to Real User")
+		# Check app-owned migration
+		self.assertEqual(frappe.db.get_value("OTP", otp_name, "user"), real_email, "OTP.user should be reassigned")
 		
+		# Existing user remains source of truth for profile unless empty
+		real_user = frappe.get_doc("User", real_email)
+		self.assertEqual(real_user.first_name, "Existing")
+		self.assertEqual(real_user.last_name, "Durable")
 
-		print(f"\n[Success] Merged {ghost_email} -> {real_email}")
+		ghost_user = frappe.get_doc("User", ghost_email)
+		self.assertEqual(ghost_user.enabled, 0, "Ghost user should be disabled after migration")
+		print(f"\n[Success] Migrated {ghost_email} -> {real_email} with manual path")
 
 	def test_convert_with_otp_enforced(self):
 		"""
@@ -238,6 +245,54 @@ class TestFrappeIdentityAPI(unittest.TestCase):
 		self.assertTrue(frappe.db.exists("User", real_email), "Real user should serve")
 		print(f"\n[Success] Verified Strict OTP flow for {real_email}")
 
+	def test_convert_with_invalid_otp(self):
+		from ghost.api.ghost import create_ghost_session, convert_to_real_user
+
+		settings = frappe.get_single("Ghost Settings")
+		settings.verify_otp_on_conversion = 1
+		settings.save()
+
+		ghost_email = create_ghost_session()["user"]
+		real_email = "invalid_otp_convert@example.com"
+		if frappe.db.exists("User", real_email):
+			frappe.delete_doc("User", real_email, force=True)
+
+		with self.assertRaises(Exception) as ctx:
+			convert_to_real_user(ghost_email, real_email, otp_code="000000")
+		self.assertIn("Invalid OTP", str(ctx.exception))
+
+	def test_conversion_revokes_ghost_tokens_and_mints_new_tokens(self):
+		from ghost.api.ghost import create_ghost_session, convert_to_real_user
+
+		settings = frappe.get_single("Ghost Settings")
+		settings.invalidate_ghost_tokens_on_conversion = 1
+		settings.verify_otp_on_conversion = 0
+		settings.save()
+
+		ghost_data = create_ghost_session()
+		ghost_email = ghost_data["user"]
+		real_email = "token_rotate_convert@example.com"
+		if frappe.db.exists("User", real_email):
+			frappe.delete_doc("User", real_email, force=True)
+
+		result = convert_to_real_user(ghost_email, real_email)
+		self.assertTrue(result.get("access_token"))
+		self.assertTrue(result.get("refresh_token"))
+
+		old_token_status = frappe.db.get_value(
+			"OAuth Bearer Token",
+			{"access_token": ghost_data["access_token"]},
+			"status",
+		)
+		self.assertEqual(old_token_status, "Revoked")
+
+		new_token_user = frappe.db.get_value(
+			"OAuth Bearer Token",
+			{"access_token": result["access_token"]},
+			"user",
+		)
+		self.assertEqual(new_token_user, real_email)
+
 	def test_role_transition(self):
 		"""
 		Test that Roles are correctly swapped after conversion.
@@ -271,4 +326,3 @@ class TestFrappeIdentityAPI(unittest.TestCase):
 		
 		self.assertIn(target_role, roles, f"User should have {target_role}")
 		print(f"\n[Success] Verified Role Transition: Ghost -> {target_role}")
-

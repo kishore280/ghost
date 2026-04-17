@@ -78,7 +78,9 @@ All cart data stays!  →  New tokens for real user
 - OAuth2 bearer tokens (industry standard, super secure)
 - No cookies needed (perfect for mobile/SPAs)
 - Tokens expire & refresh automatically
-- All ghost data merges into real user on conversion
+- Fast split conversion path:
+  - **Rename path** when `real_email` does not exist (ghost user is renamed)
+  - **Manual migration path** when `real_email` already exists (app-owned ghost data is reassigned, no heavy framework `User` merge)
 
 ---
 
@@ -183,7 +185,7 @@ We've included a **Bruno collection** with ready-to-run API tests:
 A: Yes, but it's one API call. Just call `/refresh_bearer_token` before expiry.
 
 **Q: What happens to ghost user's cart when they convert?**  
-A: Everything moves to their real account. Documents, cart items, favorites—all transferred.
+A: Conversion preserves app-owned ghost data. New emails use rename conversion; existing emails use explicit app-level migration without generic `User` merge.
 
 **Q: Can I use this in production?**  
 A: Yes! OAuth2 tokens are industry-standard. Used in real ecommerce sites.
