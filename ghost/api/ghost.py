@@ -2,6 +2,7 @@ import frappe
 from frappe import _
 from frappe.utils import random_string, get_url
 import uuid
+import time
 
 import frappe.rate_limiter
 
@@ -70,97 +71,110 @@ def create_ghost_session(email=None):
 @frappe.whitelist()
 def convert_to_real_user(ghost_email, real_email, first_name=None, last_name=None, otp_code=None):
 	"""
-	Converts a Ghost User to a Real User.
-	- If Real User exists: Merges Ghost data into Real User.
-	- If Real User does not exist: Renames Ghost User to Real User.
+	Converts a Ghost User to a Real User using one of two conversion modes:
+	- rename: lightweight rename when target user does not exist
+	- manual_migration: app-level migration when target user already exists
 	"""
 	from ghost.ghost.doctype.otp.otp import verify as verify_otp
+	from ghost.api.auth import generate_oauth_tokens
 
+	total_start = time.monotonic()
+	logger = frappe.logger("ghost_conversion")
 	settings = frappe.get_single("Ghost Settings")
 
 	if not frappe.db.exists("User", ghost_email):
 		frappe.throw(_("Ghost user {} does not exist").format(ghost_email))
 
-	# Optional: Verify OTP before conversion if enabled
+	otp_start = time.monotonic()
 	if settings.verify_otp_on_conversion:
 		if not otp_code:
 			frappe.throw(_("OTP Code is required for conversion."))
-		
-		# Verify the OTP for the REAL email (since that is what we are verifying ownership of)
-		# This will raise exception if invalid or expired.
+
 		verify_otp(otp_code, email=real_email, purpose="Conversion")
+	logger.info(
+		f"Ghost conversion OTP verification duration_ms={(time.monotonic() - otp_start) * 1000:.2f} "
+		f"ghost={ghost_email} real={real_email}"
+	)
 
-	# Check if target exists
+	existence_start = time.monotonic()
 	target_exists = frappe.db.exists("User", real_email)
+	logger.info(
+		f"Ghost conversion target existence check duration_ms={(time.monotonic() - existence_start) * 1000:.2f} "
+		f"ghost={ghost_email} real={real_email} target_exists={bool(target_exists)}"
+	)
 
-	# 1. Rename / Merge
 	original_user = frappe.session.user
 	frappe.set_user("Administrator")
 	try:
-		# If target exists, merge=True. If not, merge=False (rename).
-		frappe.rename_doc("User", ghost_email, real_email, force=True, merge=bool(target_exists))
+		branch_start = time.monotonic()
+		if target_exists:
+			migration_stats = migrate_ghost_data_to_existing_user(ghost_email, real_email)
+			conversion_mode = "manual_migration"
+			merged = False
+		else:
+			convert_by_rename(ghost_email, real_email)
+			migration_stats = {}
+			conversion_mode = "rename"
+			merged = False
+		logger.info(
+			f"Ghost conversion branch duration_ms={(time.monotonic() - branch_start) * 1000:.2f} "
+			f"ghost={ghost_email} real={real_email} mode={conversion_mode}"
+		)
 	finally:
 		frappe.set_user(original_user)
 
-	# 2. Update Role & Profile (of the resulting user)
-	# Reload to be safe after rename
+	role_profile_start = time.monotonic()
 	user = frappe.get_doc("User", real_email)
-	
-	# Transition Logic
-	ghost_role = settings.ghost_role or "Ghost"
-	target_role = settings.default_user_role or "Website User"
-
-	# Filter out Ghost Role
-	new_roles = [r for r in user.roles if r.role != ghost_role]
-	
-	# Add Target Role if not present
-	existing_role_names = [r.role for r in new_roles]
-	if target_role and target_role not in existing_role_names:
-		new_roles.append({"doctype": "Has Role", "role": target_role})
-	
-	# Fallback safety (ensure at least one role)
-	if not new_roles:
-		new_roles.append({"doctype": "Has Role", "role": "Website User"})
-
-	user.set("roles", new_roles)
-
-	# Update Details
-	if first_name:
-		user.first_name = first_name
-	if last_name:
-		user.last_name = last_name
-	
+	apply_user_profile_and_roles(
+		user=user,
+		settings=settings,
+		first_name=first_name,
+		last_name=last_name,
+		conservative_name_update=target_exists,
+	)
 	user.save(ignore_permissions=True)
-	frappe.db.commit()
+	logger.info(
+		f"Ghost conversion role/profile update duration_ms={(time.monotonic() - role_profile_start) * 1000:.2f} "
+		f"ghost={ghost_email} real={real_email} mode={conversion_mode}"
+	)
 
-	# 3. Token Management: Invalidate ghost tokens and generate new tokens for real user
-	from ghost.api.auth import generate_oauth_tokens
-	
-	# Invalidate old ghost user tokens if configured
+	token_invalidation_start = time.monotonic()
 	if settings.invalidate_ghost_tokens_on_conversion:
-		frappe.db.sql("""
+		frappe.db.sql(
+			"""
 			UPDATE `tabOAuth Bearer Token`
 			SET status = 'Revoked'
 			WHERE user = %s AND status = 'Active'
-		""", (ghost_email,))
-		frappe.db.commit()
-		frappe.logger().info(f"Invalidated ghost tokens for {ghost_email}")
-	
-	# Generate new tokens for the converted/merged real user
+		""",
+			(ghost_email,),
+		)
+		logger.info(f"Invalidated ghost tokens for {ghost_email}")
+	logger.info(
+		f"Ghost conversion token invalidation duration_ms={(time.monotonic() - token_invalidation_start) * 1000:.2f} "
+		f"ghost={ghost_email} real={real_email}"
+	)
+
+	token_generation_start = time.monotonic()
 	try:
 		new_tokens = generate_oauth_tokens(real_email)
 	except Exception as e:
 		frappe.log_error(f"Failed to generate tokens for converted user {real_email}: {str(e)}")
-		# Don't fail the conversion if token generation fails, just log it
 		new_tokens = None
+	logger.info(
+		f"Ghost conversion token generation duration_ms={(time.monotonic() - token_generation_start) * 1000:.2f} "
+		f"ghost={ghost_email} real={real_email}"
+	)
 
 	response = {
-		"message": _("User converted/merged successfully"),
+		"message": _("User converted successfully"),
 		"user": real_email,
-		"merged": target_exists
+		"merged": merged,
+		"conversion_mode": conversion_mode,
 	}
-	
-	# Add new tokens to response if generated successfully
+
+	if migration_stats:
+		response["migration"] = migration_stats
+
 	if new_tokens:
 		response.update({
 			"access_token": new_tokens["access_token"],
@@ -168,5 +182,68 @@ def convert_to_real_user(ghost_email, real_email, first_name=None, last_name=Non
 			"expires_in": new_tokens["expires_in"],
 			"token_type": new_tokens["token_type"]
 		})
-	
+
+	frappe.db.commit()
+	logger.info(
+		f"Ghost conversion total duration_ms={(time.monotonic() - total_start) * 1000:.2f} "
+		f"ghost={ghost_email} real={real_email} mode={conversion_mode}"
+	)
 	return response
+
+
+def convert_by_rename(ghost_email, real_email):
+	frappe.rename_doc("User", ghost_email, real_email, force=True, merge=False)
+	frappe.db.set_value("User", real_email, "email", real_email, update_modified=False)
+
+
+def get_ghost_owned_reassignment_plan():
+	"""
+	Only includes app-owned doctypes and safe, explicit field updates.
+	"""
+	return [
+		{
+			"doctype": "OTP",
+			"field": "user",
+			"description": "Reassign OTP user reference from ghost to real user",
+		},
+		{
+			"doctype": "OTP",
+			"field": "email",
+			"description": "Reassign OTP email when it matches ghost email",
+		},
+	]
+
+
+def migrate_ghost_data_to_existing_user(ghost_email, real_email):
+	migration_counts = {}
+	for rule in get_ghost_owned_reassignment_plan():
+		count = frappe.db.count(rule["doctype"], filters={rule["field"]: ghost_email})
+		if count:
+			frappe.db.sql(
+				f"UPDATE `tab{rule['doctype']}` SET `{rule['field']}` = %s WHERE `{rule['field']}` = %s",
+				(real_email, ghost_email),
+			)
+		migration_counts[f"{rule['doctype']}.{rule['field']}"] = count
+
+	# Keep ghost user for audit/history; disable it so it cannot be used after migration.
+	frappe.db.set_value("User", ghost_email, "enabled", 0, update_modified=False)
+	return migration_counts
+
+
+def apply_user_profile_and_roles(user, settings, first_name=None, last_name=None, conservative_name_update=False):
+	ghost_role = settings.ghost_role or "Ghost"
+	target_role = settings.default_user_role or "Website User"
+	new_roles = [r for r in user.roles if r.role != ghost_role]
+	existing_role_names = [r.role for r in new_roles]
+
+	if target_role and target_role not in existing_role_names:
+		new_roles.append({"doctype": "Has Role", "role": target_role})
+
+	if not new_roles:
+		new_roles.append({"doctype": "Has Role", "role": "Website User"})
+	user.set("roles", new_roles)
+
+	if first_name and (not conservative_name_update or not user.first_name):
+		user.first_name = first_name
+	if last_name and (not conservative_name_update or not user.last_name):
+		user.last_name = last_name
