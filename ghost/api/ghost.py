@@ -82,6 +82,12 @@ def convert_to_real_user(ghost_email, real_email, first_name=None, last_name=Non
 	logger = frappe.logger("ghost_conversion")
 	settings = frappe.get_single("Ghost Settings")
 
+	# Prefer authenticated session user when it is a ghost user and differs
+	# from a stale client-supplied ghost_email
+	current_user = frappe.session.user
+	if current_user.startswith("ghost_") and current_user != ghost_email:
+		ghost_email = current_user
+
 	if not frappe.db.exists("User", ghost_email):
 		frappe.throw(_("Ghost user {} does not exist").format(ghost_email))
 

@@ -326,3 +326,34 @@ class TestFrappeIdentityAPI(unittest.TestCase):
 		
 		self.assertIn(target_role, roles, f"User should have {target_role}")
 		print(f"\n[Success] Verified Role Transition: Ghost -> {target_role}")
+
+	def test_convert_prefers_session_user_over_stale_ghost_email(self):
+		"""
+		If frontend sends a stale ghost_email but session.user is a different
+		ghost user, conversion should target the authenticated session user.
+		"""
+		from ghost.api.ghost import create_ghost_session, convert_to_real_user
+
+		# 1. Create the "real" current ghost (authenticated via bearer/session)
+		real_ghost_data = create_ghost_session()
+		real_ghost_email = real_ghost_data["user"]
+
+		# 2. Create another ghost to act as the stale client-supplied value
+		stale_ghost_data = create_ghost_session()
+		stale_ghost_email = stale_ghost_data["user"]
+
+		# 3. Target real email
+		target_real_email = "stale_override@example.com"
+		if frappe.db.exists("User", target_real_email):
+			frappe.delete_doc("User", target_real_email, force=True)
+
+		# 4. Authenticate as real_ghost_email but supply stale_ghost_email
+		frappe.session.user = real_ghost_email
+		result = convert_to_real_user(stale_ghost_email, target_real_email)
+
+		# 5. Verify session ghost was converted, stale ghost remains untouched
+		self.assertFalse(frappe.db.exists("User", real_ghost_email), "Session ghost should be converted")
+		self.assertTrue(frappe.db.exists("User", stale_ghost_email), "Stale ghost should remain")
+		self.assertTrue(frappe.db.exists("User", target_real_email), "Target real user should exist")
+		self.assertEqual(result.get("user"), target_real_email)
+		print(f"\n[Success] Stale ghost_email override: converted {real_ghost_email} not {stale_ghost_email}")
