@@ -47,9 +47,7 @@ def login(otp, email=None, mobile_no=None, first_name=None, last_name=None, clie
 			# --- Scenario B: Direct Login / Signup ---
 			
 			# 1. Verify OTP (Stateless verification)
-			# We use "Conversion" purpose for now as it shares the same flow intent (High security)
-			# or we could make this "Login" if we update OTP doctype options.
-			ghost_verify_otp(otp_code=otp, email=email, phone=mobile_no, purpose="Conversion")
+			ghost_verify_otp(otp_code=otp, email=email, phone=mobile_no, purpose="Login")
 			
 			# 2. Find or Create User
 			if email:
