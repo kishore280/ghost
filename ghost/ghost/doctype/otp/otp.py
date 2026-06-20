@@ -66,6 +66,12 @@ def generate(email=None, phone=None, purpose=None, user=None, send=True):
 		}
 	# ─────────────────────────────────────────────────────────────────────────
 
+	# Phone Lookup: requires only phone, looks up email from user record
+	if delivery_method == "Phone Lookup":
+		if not phone:
+			frappe.throw(_("Phone is required for Phone Lookup delivery method"))
+		email = frappe.db.get_value("User", {"mobile_no": phone}, "email") or email
+
 	if not settings.allow_anonymous_otp:
 		if delivery_method in ["Email", "Both"] and not email:
 			frappe.throw(_(f"Email is required for {delivery_method} delivery method"))
@@ -108,7 +114,7 @@ def generate(email=None, phone=None, purpose=None, user=None, send=True):
 	send_results = []
 	if send:
 		try:
-			if delivery_method in ["Email", "Both"] and email:
+			if delivery_method in ["Email", "Both", "Phone Lookup"] and email:
 				email_result = send_otp(
 
 					otp_code=otp_code,
@@ -120,7 +126,7 @@ def generate(email=None, phone=None, purpose=None, user=None, send=True):
 				if email_result:
 					send_results.append(email_result)
 
-			if delivery_method in ["SMS", "Both"] and phone:
+			if delivery_method in ["SMS", "Both", "Phone Lookup"] and phone:
 				sms_result = send_otp(
 
 					otp_code=otp_code, delivery_method="SMS", email=email, phone=phone, otp_name=otp_doc.name

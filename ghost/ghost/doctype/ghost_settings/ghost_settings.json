@@ -201,7 +201,7 @@
             "fieldname": "otp_delivery_type",
             "fieldtype": "Select",
             "label": "OTP Delivery Type",
-            "options": "Email\nSMS\nBoth\nNone",
+            "options": "Email\nSMS\nBoth\nPhone Lookup\nNone",
             "reqd": 1
         },
         {
