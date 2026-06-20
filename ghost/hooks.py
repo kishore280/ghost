@@ -9,6 +9,12 @@ app_license = "mit"
 # ------------
 after_install = "ghost.install.after_install"
 
+# Fixtures
+# --------
+fixtures = [
+    {"dt": "Email Template", "filters": [["name", "=", "OTP Verification"]]}
+]
+
 # Migrations
 # ------------
 after_migrate = "ghost.patches.v1_0.set_ghost_settings_defaults.execute"
