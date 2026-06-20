@@ -67,7 +67,7 @@ def generate(email=None, phone=None, purpose=None, user=None, send=True):
 	# ─────────────────────────────────────────────────────────────────────────
 
 	# Phone Lookup: requires only phone, looks up email from user record
-	if delivery_method == "Phone Lookup":
+	if delivery_method == "Phone Lookup" and not email:
 		if not phone:
 			frappe.throw(_("Phone is required for Phone Lookup delivery method"))
 		email = frappe.db.get_value("User", {"mobile_no": phone}, "email") or email
