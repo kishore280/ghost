@@ -177,6 +177,17 @@ def convert_to_real_user(ghost_email, real_email, first_name=None, last_name=Non
 			migration_stats = {}
 			conversion_mode = "rename"
 			merged = False
+			# The ghost user no longer exists after the rename, so restore the session
+			# to the real user instead of the dead ghost. This matters because the
+			# user.save() below triggers core User.on_update, which enqueues
+			# create_contact with enqueue_after_commit=True. frappe.enqueue captures
+			# frappe.session.user (background_jobs.py) and the worker runs the job as
+			# that user (frappe.set_user in execute_job), so the Contact — and any
+			# other post-commit doc created by user.save() — is owned by whoever the
+			# session is here. Without this, the new Contact would be owned by the
+			# ghost. (Activity Log owner is already handled synchronously in
+			# convert_by_rename, since those rows exist before the rename.)
+			original_user = real_email
 		logger.info(
 			f"Ghost conversion branch duration_ms={(time.monotonic() - branch_start) * 1000:.2f} "
 			f"ghost={ghost_email} real={real_email} mode={conversion_mode}"
