@@ -16,6 +16,14 @@ _GHOST_LINK_TABLES = [
 	("Token Cache", "user"),
 	("Route History", "user"),
 	("Activity Log", "user"),
+	# Activity Log rows the ghost created carry the ghost email in owner/modified_by;
+	# rewrite them so the activity feed shows the converted user, not the ghost.
+	("Activity Log", "owner"),
+	("Activity Log", "modified_by"),
+	# Contact created during the ghost flow is owned by the ghost; reassign to the
+	# converted user so the record's creator is the real account.
+	("Contact", "owner"),
+	("Contact", "modified_by"),
 	("Notification Settings", "user"),
 	("Notification Log", "for_user"),
 	("Notification Log", "from_user"),
